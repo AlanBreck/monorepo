@@ -8,6 +8,8 @@
 	},
 	"scripts": {
 		"build": "tsc --build",
+		"test": "tsc --noEmit && vitest run",
+		"test:watch": "vitest",
 		"dev": "tsc --watch",
 		"format": "prettier ./src --write"
 	},
@@ -18,6 +20,7 @@
 	},
 	"devDependencies": {
 		"@types/uuid": "^10.0.0",
+		"typescript": "^5.5.4",
 		"vitest": "0.34.6"
 	}
 }

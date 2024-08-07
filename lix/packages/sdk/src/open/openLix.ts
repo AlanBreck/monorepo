@@ -8,26 +8,50 @@ import { contentFromDatabase, createDialect, type SqliteDatabase } from "sqlite-
 /**
  * Common setup between different lix environments.
  */
-export async function openLix(args: { database: SqliteDatabase }) {
+export async function openLix(args: {
+	database: SqliteDatabase
+	/**
+	 * Usecase are lix apps that define their own file format,
+	 * like inlang (unlike a markdown, csv, or json plugin).
+	 *
+	 * (+) avoids separating app code from plugin code and
+	 *     resulting bundling logic.
+	 * (-) such a file format must always be opened with the
+	 *     file format sdk. the file is not portable
+	 *
+	 * @example
+	 *   const lix = await openLixInMemory({ blob: await newLixFile(), providePlugin: [myPlugin] })
+	 */
+	providePlugins?: LixPlugin[]
+}) {
 	const db = new Kysely<LixDatabase>({
 		dialect: createDialect({ database: args.database }),
 		plugins: [new ParseJSONResultsPlugin()],
 	})
 
 	const plugins = await loadPlugins(db)
+	if (args.providePlugins && args.providePlugins.length > 0) {
+		plugins.push(...args.providePlugins)
+	}
+
+	// TODO better api for awaiting pending promises
+	const maybePendingPromises: Promise<any>[] = []
 
 	args.database.createFunction({
 		name: "handle_file_change",
-		arity: 3,
+		arity: 4,
 		// @ts-expect-error - dynamic function
-		xFunc: (_, fileId: any, oldData: any, neuData: any) => {
-			handleFileChange({
-				fileId,
-				oldData,
-				neuData,
-				plugins,
-				db,
-			})
+		xFunc: (_, fileId: any, oldData: any, neuData: any, path: any) => {
+			maybePendingPromises.push(
+				handleFileChange({
+					fileId,
+					path,
+					oldData,
+					neuData,
+					plugins,
+					db,
+				})
+			)
 			return
 		},
 	})
@@ -35,21 +59,24 @@ export async function openLix(args: { database: SqliteDatabase }) {
 	await sql`
 	CREATE TEMP TRIGGER file_modified AFTER UPDATE ON file
 	BEGIN
-	  SELECT handle_file_change(NEW.id, OLD.data, NEW.data);
+	  SELECT handle_file_change(NEW.id, OLD.data, NEW.data, OLD.path);
 	END;
 	`.execute(db)
 
 	args.database.createFunction({
 		name: "handle_file_insert",
-		arity: 2,
+		arity: 3,
 		// @ts-expect-error - dynamic function
-		xFunc: (_, fileId: any, newData: any) => {
-			handleFileInsert({
-				fileId,
-				newData,
-				plugins,
-				db,
-			})
+		xFunc: (_, fileId: any, newData: any, path: any) => {
+			maybePendingPromises.push(
+				handleFileInsert({
+					fileId,
+					newData,
+					plugins,
+					db,
+					path,
+				})
+			)
 			return
 		},
 	})
@@ -57,13 +84,16 @@ export async function openLix(args: { database: SqliteDatabase }) {
 	await sql`
 	CREATE TEMP TRIGGER file_inserted AFTER INSERT ON file
 	BEGIN
-	  SELECT handle_file_insert(NEW.id, NEW.data);
+	  SELECT handle_file_insert(NEW.id, NEW.data, NEW.path);
 	END;
 	`.execute(db)
 
 	return {
 		db,
-		toBlob: () => new Blob([contentFromDatabase(args.database)]),
+		toBlob: async () => {
+			await Promise.all(maybePendingPromises)
+			return new Blob([contentFromDatabase(args.database)])
+		},
 		plugins,
 		close: async () => {
 			args.database.close()
@@ -113,6 +143,7 @@ async function loadPlugins(db: Kysely<LixDatabase>) {
 
 async function handleFileChange(args: {
 	fileId: LixFile["id"]
+	path: LixFile["path"]
 	oldData: LixFile["data"]
 	neuData: LixFile["data"]
 	plugins: LixPlugin[]
@@ -122,12 +153,16 @@ async function handleFileChange(args: {
 		const diffs = await plugin.diff?.file?.({
 			old: args.oldData,
 			neu: args.neuData,
+			path: args.path,
 		})
 		for (const diff of diffs ?? []) {
+			// assume an insert or update operation as the default
+			// if diff.neu is not present, it's a delete operation
+			const value = diff.neu ?? diff.old
 			const previousUncomittedChange = await args.db
 				.selectFrom("change")
 				.selectAll()
-				.where((eb) => eb.ref("value", "->>").key("id"), "=", diff.value.id)
+				.where((eb) => eb.ref("value", "->>").key("id"), "=", value.id)
 				.where("type", "=", diff.type)
 				.where("file_id", "=", args.fileId)
 				.where("plugin_key", "=", plugin.key)
@@ -144,7 +179,7 @@ async function handleFileChange(args: {
 						file_id: args.fileId,
 						plugin_key: plugin.key,
 						// @ts-expect-error - database expects stringified json
-						value: JSON.stringify(diff.value),
+						value: JSON.stringify(value),
 						meta: JSON.stringify(diff.meta),
 					})
 					.execute()
@@ -154,7 +189,7 @@ async function handleFileChange(args: {
 			const previousCommittedChange = await args.db
 				.selectFrom("change")
 				.selectAll()
-				.where((eb) => eb.ref("value", "->>").key("id"), "=", diff.value.id)
+				.where((eb) => eb.ref("value", "->>").key("id"), "=", value.id)
 				.where("type", "=", diff.type)
 				.where("file_id", "=", args.fileId)
 				.where("commit_id", "is not", null)
@@ -175,7 +210,7 @@ async function handleFileChange(args: {
 					// drop the change because it's identical
 					await args.db
 						.deleteFrom("change")
-						.where((eb) => eb.ref("value", "->>").key("id"), "=", diff.value.id)
+						.where((eb) => eb.ref("value", "->>").key("id"), "=", value.id)
 						.where("type", "=", diff.type)
 						.where("file_id", "=", args.fileId)
 						.where("plugin_key", "=", plugin.key)
@@ -191,7 +226,7 @@ async function handleFileChange(args: {
 			// to avoid (potentially) saving every keystroke change
 			await args.db
 				.updateTable("change")
-				.where((eb) => eb.ref("value", "->>").key("id"), "=", diff.value.id)
+				.where((eb) => eb.ref("value", "->>").key("id"), "=", value.id)
 				.where("type", "=", diff.type)
 				.where("file_id", "=", args.fileId)
 				.where("plugin_key", "=", plugin.key)
@@ -199,7 +234,7 @@ async function handleFileChange(args: {
 				.set({
 					id: v4(),
 					// @ts-expect-error - database expects stringified json
-					value: JSON.stringify(diff.value),
+					value: JSON.stringify(value),
 					meta: JSON.stringify(diff.meta),
 				})
 				.execute()
@@ -210,6 +245,7 @@ async function handleFileChange(args: {
 // creates initial commit
 async function handleFileInsert(args: {
 	fileId: LixFile["id"]
+	path: LixFile["path"]
 	newData: LixFile["data"]
 	plugins: LixPlugin[]
 	db: Kysely<LixDatabase>
@@ -218,6 +254,7 @@ async function handleFileInsert(args: {
 		const diffs = await plugin.diff?.file?.({
 			old: undefined,
 			neu: args.newData,
+			path: args.path,
 		})
 		for (const diff of diffs ?? []) {
 			await args.db
