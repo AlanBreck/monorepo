@@ -14,13 +14,7 @@ export type LixPlugin<T extends Record<string, Record<string, unknown>> = Record
 		(() => HTMLElement) | undefined
 	>
 	diff: {
-		file?: (args: {
-			old?: LixFile["data"]
-			neu?: LixFile["data"]
-			// TODO remove this hack in favor of
-			// providing the entire lix file object
-			path?: LixFile["path"]
-		}) => MaybePromise<Array<DiffReport>>
+		file?: (args: { old?: LixFile; neu?: LixFile }) => MaybePromise<Array<DiffReport>>
 	} & Record<
 		// other primitives
 		keyof T,
@@ -35,14 +29,14 @@ type MaybePromise<T> = T | Promise<T>
  */
 export type DiffReport = {
 	type: string
-	operation: "insert" | "update" | "delete"
+	operation: "create" | "update" | "delete"
 	old?: Record<string, any> & { id: string }
 	neu?: Record<string, any> & { id: string }
 	meta?: Record<string, any>
 } & (DiffReportInsertion | DiffReportUpdate | DiffReportDeletion)
 
 type DiffReportInsertion = {
-	operation: "insert"
+	operation: "create"
 	old: undefined
 	neu: Record<string, any> & {
 		id: string
