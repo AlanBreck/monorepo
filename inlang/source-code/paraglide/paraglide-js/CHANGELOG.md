@@ -1,5 +1,11 @@
 # @inlang/paraglide-js
 
+## 1.11.3
+
+### Patch Changes
+
+- a1ea1ff: fix internal issues
+
 ## 1.11.2
 
 ### Patch Changes
